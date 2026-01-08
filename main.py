@@ -1,30 +1,45 @@
+import os
+import time
+import logging
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+PATH_OUTPUT = "output"
+if not os.path.exists(PATH_OUTPUT):
+    os.makedirs(PATH_OUTPUT)
+
+# ---------- 權重設定 ----------
 weights_normal = {
-    "uniform": 0.4,  # 均勻分布
-    "center": 1.2,  # 中心高斯分布
-    "anti": 1.1,  # 反焦點分布
-    "border": 1.3,  # 邊緣偏好分布
-    "levelk": 0.7,  # 水平混合分布
+    "uniform": 0.4,
+    "center": 1.2,
+    "anti": 1.1,
+    "border": 1.3,
+    "levelk": 0.7,
 }
 
 weights_new = {
-    "uniform": 0.50,  # 很多人剛來會亂選或隨便點
-    "center": 1.40,  # 視覺/直覺中心偏好高
-    "anti": 0.80,  # 會避中心的人較少
-    "border": 1.00,  # 邊界有吸引力但不極端
-    "levelk": 0.60,  # 深度推理者很少
+    "uniform": 0.50,
+    "center": 1.40,
+    "anti": 0.80,
+    "border": 1.00,
+    "levelk": 0.60,
 }
 
-
 weights_old = {
-    "uniform": 0.05,  # 幾乎不亂選
-    "center": 0.70,  # 中心被視為高競爭區（反而下降）
-    "anti": 2.50,  # 強烈避開大家會預期的選擇（反焦點）
-    "border": 1.80,  # 邊界/角落變成常見替代
-    "levelk": 2.00,  # 很多人會做多層次推理
+    "uniform": 0.05,
+    "center": 0.70,
+    "anti": 2.50,
+    "border": 1.80,
+    "levelk": 2.00,
 }
 
 weights_mix = {
@@ -46,17 +61,23 @@ weights_all = {
 # ---------- 工具函數 ----------
 def normalize(v):
     v = np.array(v, dtype=float)
-    return v / v.sum()
+    s = v.sum()
+    if s == 0:
+        return np.ones_like(v) / len(v)
+    return v / s
 
 
-# ---------- 核心模型 ----------
-def compute_distribution(width, height, weights):
+# ---------- 核心模型（加噪聲） ----------
+def compute_distribution(
+    width, height, weights, noise_level=0.6, gauss_share=0.8, use_noise=True
+):
     coords = [(x, y) for y in range(1, height + 1) for x in range(1, width + 1)]
+    n = len(coords)
 
     cx, cy = (width + 1) / 2, (height + 1) / 2
     sx, sy = width / 4, height / 4
 
-    # 1. Center Gaussian
+    # Center Gaussian
     gauss = np.array(
         [
             np.exp(-(((x - cx) ** 2) / (2 * sx * sx) + ((y - cy) ** 2) / (2 * sy * sy)))
@@ -65,13 +86,13 @@ def compute_distribution(width, height, weights):
     )
     gauss = normalize(gauss)
 
-    # 2. Uniform
-    uniform = np.ones(len(coords)) / len(coords)
+    # Uniform
+    uniform = np.ones(n) / n
 
-    # 3. Anti-focal
+    # Anti-focal
     anti = normalize(1 - gauss)
 
-    # 4. Border favor
+    # Border favor
     border = np.array(
         [
             2.0 if (x == 1 or x == width or y == 1 or y == height) else 0.9
@@ -80,7 +101,7 @@ def compute_distribution(width, height, weights):
     )
     border = normalize(border)
 
-    # 5. Level-k mix
+    # Level-k mix
     describable = np.array(
         [
             (
@@ -101,8 +122,7 @@ def compute_distribution(width, height, weights):
         0.45 * gauss + 0.35 * border + 0.20 * (non_desc + 0.1 * describable)
     )
 
-    # ---------- 加權整合 ----------
-
+    # 加權整合
     agg = (
         weights["uniform"] * uniform
         + weights["center"] * gauss
@@ -110,15 +130,114 @@ def compute_distribution(width, height, weights):
         + weights["border"] * border
         + weights["levelk"] * levelk
     )
-
     agg = normalize(agg)
-    return coords, agg
+
+    if not use_noise:
+        return coords, agg, 0.0, 0.0
+
+    # 噪聲設定
+    mean_p = 1.0 / n
+    noise_magnitude = noise_level * mean_p
+    gauss_std = noise_magnitude * gauss_share
+    uniform_half_range = noise_magnitude * (1.0 - gauss_share)
+
+    return coords, agg, gauss_std, uniform_half_range
+
+
+# ---------- 大量模擬 ----------
+def simulate_many(
+    width,
+    height,
+    weights,
+    weights_name="",
+    n_iter=10_000_000,
+    noise_level=0.6,
+    gauss_share=0.8,
+    use_noise=True,
+    pbar=None,
+):
+    coords, base_probs, gauss_std, uniform_half_range = compute_distribution(
+        width, height, weights, noise_level, gauss_share, use_noise
+    )
+    n = len(coords)
+    counts = np.zeros(n, dtype=np.float64)
+
+    batch_size = 100_000
+    n_batches = n_iter // batch_size
+    for b in range(n_batches):
+        if use_noise:
+            gauss_noise = np.random.normal(0, gauss_std, size=(batch_size, n))
+            uniform_noise = np.random.uniform(
+                -uniform_half_range, uniform_half_range, size=(batch_size, n)
+            )
+            total_noise = gauss_noise + uniform_noise
+            probs_batch = base_probs + total_noise
+            probs_batch = np.clip(probs_batch, 1e-12, None)
+            probs_batch = probs_batch / probs_batch.sum(axis=1, keepdims=True)
+        else:
+            probs_batch = np.tile(base_probs, (batch_size, 1))
+
+        samples = np.random.choice(
+            n, size=batch_size, p=probs_batch[0] if not use_noise else None
+        )
+        if use_noise:
+            for i in range(batch_size):
+                s = np.random.choice(n, p=probs_batch[i])
+                counts[s] += 1
+        else:
+            for s in samples:
+                counts[s] += 1
+
+        if pbar is not None:
+            pbar.update(batch_size)
+            pbar.set_postfix_str(f"{width}x{height} [{weights_name}]")
+
+    remaining = n_iter % batch_size
+    if remaining > 0:
+        if use_noise:
+            gauss_noise = np.random.normal(0, gauss_std, size=(remaining, n))
+            uniform_noise = np.random.uniform(
+                -uniform_half_range, uniform_half_range, size=(remaining, n)
+            )
+            total_noise = gauss_noise + uniform_noise
+            probs_batch = base_probs + total_noise
+            probs_batch = np.clip(probs_batch, 1e-12, None)
+            probs_batch = probs_batch / probs_batch.sum(axis=1, keepdims=True)
+            for i in range(remaining):
+                s = np.random.choice(n, p=probs_batch[i])
+                counts[s] += 1
+        else:
+            samples = np.random.choice(n, size=remaining, p=base_probs)
+            for s in samples:
+                counts[s] += 1
+        if pbar is not None:
+            pbar.update(remaining)
+
+    probs_final = counts / counts.sum()
+    return coords, probs_final
+
+
+def run_single_task(task_params):
+    width, height, weights, weights_name, n_iter, noise_params = task_params
+    coords, probs = simulate_many(
+        width,
+        height,
+        weights,
+        weights_name=weights_name,
+        n_iter=n_iter,
+        pbar=None,
+        **noise_params,
+    )
+    filename = plot_heatmap_from_probs(
+        width, height, coords, probs, weights_name, n_iter
+    )
+    return filename
 
 
 # ---------- 畫熱圖 ----------
-def plot_heatmap(width, height, weights_name, weights):
-    coords, probs = compute_distribution(width, height, weights)
-
+def plot_heatmap_from_probs(
+    width, height, coords, probs, weights_name, total_iterations
+):
     grid = np.zeros((height, width))
     for (x, y), p in zip(coords, probs):
         grid[y - 1, x - 1] = p
@@ -126,28 +245,66 @@ def plot_heatmap(width, height, weights_name, weights):
     plt.figure(figsize=(width / 2, height / 2))
     plt.imshow(grid, origin="lower")
     plt.colorbar(label="Selection Probability")
-    plt.title(f"{width} x {height} Selection Heatmap")
+    plt.title(f"{width} x {height} Selection Heatmap ({weights_name})")
     plt.xticks(range(width), range(1, width + 1))
     plt.yticks(range(height), range(1, height + 1))
     plt.tight_layout()
 
-    filename = f"{weights_name}_{width}x{height}_heatmap.png"
-    plt.savefig(filename, dpi=200)
+    filename = f"{total_iterations:,}_{weights_name}_{width}x{height}_heatmap.png"
+    plt.savefig(os.path.join(PATH_OUTPUT, filename), dpi=200)
     plt.close()
-
-    # 冷點推薦
-    df = pd.DataFrame(
-        {"x": [c[0] for c in coords], "y": [c[1] for c in coords], "prob": probs}
-    ).sort_values("prob")
-
-    print(f"\n=== {width} x {height} 最低被選機率 Top 10 ===")
-    print(df.head(10).assign(prob=lambda d: (d.prob * 100).round(3)))
-
     return filename
 
 
-# ---------- 執行 ----------
-for w, h in [(8, 5), (10, 12), (16, 10)]:
-    for weights_name, weights in weights_all.items():
-        fname = plot_heatmap(w, h, weights_name, weights)
-    print(f"已輸出熱圖：{fname}")
+# ---------- 命令列介面 ----------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Simulate human-like selection with noise."
+    )
+    parser.add_argument(
+        "-i",
+        "--iterations",
+        type=int,
+        required=True,
+        help="Number of simulation iterations",
+    )
+    parser.add_argument(
+        "-n",
+        "--noise",
+        action="store_true",
+        help="Enable Gaussian + Uniform noise",
+    )
+    args = parser.parse_args()
+
+    noise_params = {"noise_level": 0.6, "gauss_share": 0.8, "use_noise": args.noise}
+
+    grid_sizes = [(8, 5), (10, 12), (16, 10)]
+    total_tasks = len(grid_sizes) * len(weights_all)
+    total_iterations = total_tasks * args.iterations
+
+    max_workers = max(1, (os.cpu_count() or 2) // 2)
+    logging.info(
+        f"開始模擬: {total_tasks} 個任務, 共 {total_iterations:,} 次迭代, 使用 {max_workers} 個 workers"
+    )
+    start_time = time.time()
+
+    tasks = []
+    for w, h in grid_sizes:
+        for weights_name, weights in weights_all.items():
+            tasks.append((w, h, weights, weights_name, args.iterations, noise_params))
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(run_single_task, task): task for task in tasks}
+        with tqdm(total=total_tasks, desc="圖片生成進度", unit="圖") as pbar:
+            for future in as_completed(futures):
+                task = futures[future]
+                try:
+                    filename = future.result()
+                    logging.info(f"已輸出熱圖：{filename}")
+                except Exception as e:
+                    logging.error(f"任務失敗 {task[3]} {task[0]}x{task[1]}: {e}")
+                pbar.update(1)
+
+    elapsed = time.time() - start_time
+    speed = total_iterations / elapsed
+    logging.info(f"完成！總耗時: {elapsed:.2f} 秒, 平均速度: {speed:,.0f} iter/s")
