@@ -14,6 +14,8 @@ logging.basicConfig(
 )
 
 PATH_OUTPUT = "output"
+NUM_WORKERS = 28
+
 if not os.path.exists(PATH_OUTPUT):
     os.makedirs(PATH_OUTPUT)
 
@@ -250,8 +252,11 @@ def plot_heatmap_from_probs(
     plt.yticks(range(height), range(1, height + 1))
     plt.tight_layout()
 
-    filename = f"{total_iterations:,}_{weights_name}_{width}x{height}_heatmap.png"
-    plt.savefig(os.path.join(PATH_OUTPUT, filename), dpi=200)
+    filename = f"{weights_name}_{width}x{height}_heatmap.png"
+    grid_dir = os.path.join(PATH_OUTPUT, f"{total_iterations:,}")
+    if not os.path.exists(grid_dir):
+        os.makedirs(grid_dir)
+    plt.savefig(os.path.join(grid_dir, filename), dpi=200)
     plt.close()
     return filename
 
@@ -282,9 +287,8 @@ if __name__ == "__main__":
     total_tasks = len(grid_sizes) * len(weights_all)
     total_iterations = total_tasks * args.iterations
 
-    max_workers = max(1, (os.cpu_count() or 2) // 2)
     logging.info(
-        f"開始模擬: {total_tasks} 個任務, 共 {total_iterations:,} 次迭代, 使用 {max_workers} 個 workers"
+        f"開始模擬: {total_tasks} 個任務, 共 {total_iterations:,} 次迭代, 使用 {NUM_WORKERS} 個 workers"
     )
     start_time = time.time()
 
@@ -293,7 +297,7 @@ if __name__ == "__main__":
         for weights_name, weights in weights_all.items():
             tasks.append((w, h, weights, weights_name, args.iterations, noise_params))
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
         futures = {executor.submit(run_single_task, task): task for task in tasks}
         with tqdm(total=total_tasks, desc="圖片生成進度", unit="圖") as pbar:
             for future in as_completed(futures):
